@@ -60,4 +60,6 @@ sudo systemctl stop getty.target
 sudo systemctl disable hciuart
 </code>
 
+Note: Try looking at the CNCSerial.log file to see if it explains any cause for the failure.  
+
 More information will be added soon.
