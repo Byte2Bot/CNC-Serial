@@ -48,4 +48,16 @@ gh repo clone Byte2Bot/CNC-Serial
 Red LED: On = Stopped (transmission is stopped).  Blinking = Paused (transmission and reception is paused). Off = Normal operation.
 
 
+# Troubleshooting
+The pi configuration needs to be set so the serial port is enabled, but the console is not. Also, enable I2C:
+![PiSettings](https://user-images.githubusercontent.com/130330728/232680315-a24bd43c-57b1-4055-8e3e-fecd00290204.jpg)
+
+After changing the settings, reboot for them to take effect.
+
+If you are still having trouble, try the following:
+<code>
+sudo systemctl stop getty.target
+sudo systemctl disable hciuart
+</code>
+
 More information will be added soon.
