@@ -4,8 +4,7 @@
 
 #include <iostream>
 #include <thread>
-#include <stdarg.h> //for va_start/va_end
-
+#include "Log.h"
 #include "CircularQueue.h"
 
 //#define SERIAL_PORT "/dev/ttyS0" //mini UART, does not have flow control
@@ -18,16 +17,18 @@
 #define FILE_NAME "1001.nc"     // Change this to the name of the file you want to send
 
 //These are the de-facto standard flow control bytes
-#define XON 0x11		//Device Control 1 (Start)
-#define DC2 0x12		//Device Control 2 (Start of Data)
-#define XOFF 0x13		//Device Control 3 (Stop) - when parameter 0055#0 = 1
-#define DC4 0x14		//Device Control 4 (End of Data)
-#define XOFF2 0x93		//Stop - when parameter 0055 = 0
+#define XON 0x11		//Device Control 1 (Start) (DC1)
+#define DC2 0x12		//Device Control 2 (Start of Data) sent by sender before sending data
+#define XOFF 0x13		//Device Control 3 (Stop) (DC3) - when parameter 0055#0 = 1
+#define DC4 0x14		//Device Control 4 (End of Data) sent by sender after sending data
+#define XOFF2 0x93		//Stop - when Fanuc parameter 0055 = 0, also default for Mitsubishi
 #define NAK 0x15		//Sent by CNC when there is an Alarm, parameter 0055#0 = 1
 #define NAK2 0x95		//parameter 0055#0 = 0
 #define SYN 0x16		//Sent by CNC when there is an NC Reset, parameter 0055#0 = 1
 #define SYN2 0x96		//parameter 0055#0 = 0
 
+
+#define CNC_BUF_SIZE 256		//our internal memory buffer for TX.
 
 #ifndef TRUE
 #define TRUE 1
@@ -38,7 +39,6 @@
 #define CNC_OK 1
 #define CNC_TIMEOUT 2
 
-#define SERIAL_1S_TIMEOUT  1000  //ms
 
 extern int errno;	//in errno.h
 
@@ -99,6 +99,7 @@ enum FlowControlValues
 	FLOW_CONTROL_NONE = 0,
 	FLOW_CONTROL_HARDWARE = 1,
 	FLOW_CONTROL_SOFTWARE = 2,	
+	FLOW_CONTROL_GRBL = 3,
 	FLOW_CONTROL_MASK = 0x03
 };
 
@@ -111,10 +112,11 @@ enum StopBitValues
 
 enum DataBitValues
 {
+	DATA_BITS_5 = 5,
 	DATA_BITS_6 = 6,
 	DATA_BITS_7 = 7,
 	DATA_BITS_8 = 8,
-	DATA_BITS_9 = 9,
+	//DATA_BITS_9 = 9,
 	DATA_BITS_MASK = 0x0F
 	
 };
@@ -133,12 +135,6 @@ enum SerialLEDStates
 	SERIAL_LED_BLINKING = 2
 };	
 
-//SerialLogMode is used as a bit mask, so be careful when setting specific values.
-
-#define LOG_MODE_NONE 0
-#define LOG_MODE_PRINT (1<<0)
-#define LOG_MODE_FILE (1<<1)		//Setting this will log to "CNCSerial.log"
-
 
 
 class CNCSerial
@@ -150,6 +146,12 @@ class CNCSerial
 		
 		char inFileName[128];
 		char outFileName[128];
+		
+		char pStatus[128];
+		int pStatusNew;
+		
+		char pSerialName[64];
+		
 		
 		//flags for the threads
 		int pDone;
@@ -163,10 +165,16 @@ class CNCSerial
 		int pStopReceivingFile;
 		
 		int pSerialThreadRunning;
-		int pButtonThreadRunning;
+		int pIOThreadRunning;
 		
-		int pStartPauseButton;
-		int pStopButton;		
+		int pStartPauseButton;		//This keeps track of the button status
+		int pStopButton;			//This keeps track of the button status
+		int pStartPauseButtonFlag;  //This tells the SerialThread to handle the press
+		int pStopButtonFlag;		//This tells the SerialThread to handle the press
+		
+		int pUseRxFlowControl;
+		int pUseStartStopChar;
+		unsigned char pStartStopChar;
 		
 		FlowControlValues pFlowControl;  	//actual. default to HW
 		FlowControlValues pNewFlowControl;	//requested.	
@@ -177,12 +185,20 @@ class CNCSerial
 		DataBitValues pDataBits;
 		int pBaudRate;
 		
+		unsigned char pXOFFByte;
+		
+		int pCurrentLine;
+		int pNumLines;
+		
 		int pLogMode;
 		int pLogRx;
 		int pLogTx;
 		
 		int pRTS;		//actual
 		int pNewRTS;	//requested
+		
+		int pDSR;
+		int pNewDSR;
 		
 		int pDTR;		//actual
 		int pNewDTR;	//requested
@@ -195,6 +211,12 @@ class CNCSerial
 		int pMachinePaused;
 		int pUserPaused;
 		
+		int pReopen;
+		int pSingleStep;
+		int pDoStep;
+		//int pNewSingleStep;
+		//int pNewDoStep;
+		
 		
 		//variables to control serial flow
 		int pflushRequested;
@@ -202,10 +224,15 @@ class CNCSerial
 		int pPacketDelay;  //mS
 		int pIgnoreNULL;
 		
+		int pGRBLReplyIndex;
+		int pGRBLNextFlag;
+		char pGRBLReply[128]; 
+		
  
 		//Statistics
 		unsigned long pBytesSent;
 		unsigned long pBytesReceived;
+		unsigned long pFileSize;
 		
 
 		//private functions
@@ -216,15 +243,18 @@ class CNCSerial
 		int actualSetFlowControl(FlowControlValues value);
 		int actualSetDTR( unsigned short level);
 		int actualGetCTS();
+		int actualSetDSR( unsigned short level);
 		
 		int serialPollingThread();
-		int buttonPollingThread();
+		int ioPollingThread();  //define this in app code if using a different hat.
+		
+		void setStatus(char *text);
 		
 		void log(const char *message, ...);
 		
 		int receive(unsigned char *rxdata, int maxlength);
 		std::thread *serialthread;
-		std::thread *buttonthread;
+		std::thread *iothread;
 		
 	public:
 		CNCSerial();
@@ -243,8 +273,28 @@ class CNCSerial
 		void setBaud(int value);
 		int getBaud();
 		
+		void setSerialName(char *name);
+		char *getSerialName();
+		
+		void setXOFFByte( char byte );
+		unsigned char getXOFFByte();
+		
+		int getUseRxFlowControl();
+		void setUseRxFlowControl( int val );
+		
+		int getUseStartStopChar();
+		void setUseStartStopChar( int val );
+		
+		unsigned char getStartStopChar();
+		void setStartStopChar( unsigned char val );
+		
+		
+		int saveSettings(char *settingsFileName);
+		int loadSettings(char *settingsFileName, char *prefix);
 		
 		//These can be used at runtime
+		void reopen();
+		
 		void setFlowControl(FlowControlValues value);
 		FlowControlValues getFlowControl();	
 		
@@ -254,6 +304,9 @@ class CNCSerial
 		void setRTS(unsigned short level);
 		int getRTS();
 		
+		void setDSR(unsigned short level);
+		int getDSR();
+		
 		void setFlush(int value);
 		int getFlush();
 		
@@ -261,11 +314,14 @@ class CNCSerial
 		
 		void resetStats();
 		void printStatus();
+		void clearQueues();
 		
 		void setUserPaused(int value);
 		int getUserPaused();
 		int getMachinePaused();
 		
+		int getSingleStep();
+		void setSingleStep(int value);
 		
 		int getStopButton();
 		
@@ -277,6 +333,18 @@ class CNCSerial
 		int getLogRx();
 		int getLogTx();
 		
+		char *getStatus();
+		int isStatusNew();// {return pStatusNew; }
+		
+		
+		unsigned long getFileSize();
+		unsigned long getNumBytesSent();
+		
+		int getRxQueueSize(); //returns the size of the RX queue
+		unsigned char getRxQueueByte();  //returns a byte from the RX queue, 0 if not available
+		
+		int getCurrentLine();
+		int getNumLines();
 		
 		
 		int send(unsigned char *txdata, int length);
@@ -287,8 +355,12 @@ class CNCSerial
 		int sendFile(char *filename);
 		int receiveFile(char *filename);
 		
+		int sendString(char *str);
+		
 		int isFileSending();  //1=YES, 0=NO
 		int isFileReceiving();  //1=YES, 0=NO
+		
+		int isSerialThreadRunning();
 		
 		void stopReceiveFile();
 		void stopSendFile();
@@ -301,8 +373,14 @@ class CNCSerial
 		void setPacketDelayMs(unsigned int microseconds);
 		unsigned int getPacketDelayMs();
 		
-		int startThreads();
+		int startThreads(int useButtonThread); //button thread is only useful for CNCFeeder
 		int stopThreads();
+		
+		void StopButtonPress();
+		void StartPauseButtonPress();
+		
+		unsigned long getBytesSent() {return pBytesSent; }
+		unsigned long getBytesReceived() {return pBytesReceived; }
 };
 
 #endif  //__CNCSERIAL_H__

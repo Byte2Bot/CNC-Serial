@@ -12,11 +12,12 @@
 
 #include "CNCSerial.h"
 #include "Timers.h"
+#include "XMLParser.h"
 
 
 //#define DEBUG 1
 
-#define CNC_BUF_SIZE 256
+
 unsigned char inbuf[CNC_BUF_SIZE];
 unsigned char inbuf2[CNC_BUF_SIZE];  //parsed and sanitized version of inbuf
 unsigned char outbuf[CNC_BUF_SIZE];
@@ -28,6 +29,8 @@ CNCSerial::CNCSerial()
 {
 	serial_fd = 0;
 	log_fd = 0;
+	
+	pReopen = 0;
 	
 	pSendingFile = 0; 
 	pReceivingFile = 0;
@@ -42,31 +45,50 @@ CNCSerial::CNCSerial()
 	
 	pLogRx = 1;	//default to logging the RX and TX data
 	pLogTx = 1;
+	
+	pCurrentLine = 0;
+	pNumLines = 0;
 
 	pIgnoreNULL = 1; //CNC will send lots of 0x00 when delaying. ignore them.
 
 	pRTS = 0;
 	pDTR = 0;
+	pDSR = 0;
 	pDone = 0;
 
 	pNewRTS = 0;
 	pNewDTR = 0;
+	pNewDSR = 0;
 	pNewFlowControl = FLOW_CONTROL_HARDWARE;  //default to HW
 	pClearToSend = 0; //default to flow control stopping any sends.
 	pUserPaused = 0;	//user paused
 	pMachinePaused = 0;
 	
 	serialthread = 0;  //this is a pointer, so NULL it out initially
-	buttonthread = 0;  //this is a pointer, so NULL it out initially
+	iothread = 0;  //this is a pointer, so NULL it out initially
 	
-	pButtonThreadRunning = 0;
+	pIOThreadRunning = 0;
 	pSerialThreadRunning = 0;
 	//flow_control;
 	//stop_bits;
 	
+	//TODO: put default serial params here:
+	pXOFFByte = XOFF;  //or XOFF2
+	pUseRxFlowControl = 0;
+	pUseStartStopChar = '%';
+	pStartStopChar = 0;
+	
+	
+	pSingleStep = 0; //Always start up with this off
+	pDoStep = 0;
+	
 	pPacketDelay = 0;
 	pPacketLength = 0;
 	pflushRequested = 1;
+	
+	strcpy( pSerialName, SERIAL_PORT);  //this needs to be something
+	
+	pFileSize = 0;
 	
 	rxData.reset();
 	txData.reset();
@@ -75,6 +97,26 @@ CNCSerial::CNCSerial()
 CNCSerial::~CNCSerial()
 {
 	stopThreads();
+}
+
+void CNCSerial::setSerialName(char *name)
+{
+	strcpy(pSerialName, name);
+}
+
+char *CNCSerial::getSerialName()
+{
+	return pSerialName;
+}
+		
+int CNCSerial::getCurrentLine()
+{
+	return pCurrentLine;
+}
+
+int CNCSerial::getNumLines()
+{
+	return pNumLines;
 }
 
 void CNCSerial::setLogRx( int value )
@@ -153,6 +195,47 @@ int CNCSerial::getBaud()
 	return pBaudRate;
 }
 		
+void CNCSerial::setXOFFByte( char byte )
+{
+	if(byte == XOFF2)  //0x93
+		pXOFFByte = byte;
+	else
+		pXOFFByte = XOFF;  //default
+}
+unsigned char CNCSerial::getXOFFByte()
+{
+	return pXOFFByte;
+}
+
+void CNCSerial::StartPauseButtonPress()
+{
+	pStartPauseButtonFlag = 1;
+}
+
+void CNCSerial::StopButtonPress()
+{
+	pStopButtonFlag = 1;
+}
+
+int CNCSerial::getSingleStep()
+{
+	return pSingleStep;
+}
+
+void CNCSerial::setSingleStep(int value)
+{
+	pSingleStep = (value & 0x01);
+	if(pSingleStep == 0)
+	{
+		pUserPaused = 1; //set to paused when turning off the single step mode
+	}
+	else
+	{
+		pUserPaused = 0; //turn off paused when entering single step mode
+		pDoStep = 0;
+	}
+	log("Setting Single Step: %d\n", pSingleStep);
+}
 		
 
 FlowControlValues CNCSerial::getFlowControl()
@@ -173,7 +256,7 @@ int CNCSerial::getUserPaused()
 	return pUserPaused;
 }
 
-void CNCSerial::setFlowControl(FlowControlValues value)  //FLOW_CONTROL_SOFTWARE, FLOW_CONTROL_HARDWARE, or FLOW_CONTROL_NONE
+void CNCSerial::setFlowControl(FlowControlValues value)  //FLOW_CONTROL_SOFTWARE, FLOW_CONTROL_GRBL, FLOW_CONTROL_HARDWARE, or FLOW_CONTROL_NONE
 {
 	pNewFlowControl = value;
 }
@@ -194,6 +277,11 @@ int CNCSerial::isFileReceiving()
 	return pReceivingFile;
 }
 
+int CNCSerial::isSerialThreadRunning()
+{
+	return pSerialThreadRunning;
+}
+
 // DTR is a modem handshake line
 // Not necessary for this application
 
@@ -203,10 +291,20 @@ void CNCSerial::setDTR( unsigned short level)  //0 or non-zero
 	pNewDTR = level;
 }
 
+void CNCSerial::setDSR( unsigned short level)
+{
+	pNewDSR = level;
+}
+
 
 int CNCSerial::getDTR()
 {
 	return pDTR;
+}
+
+int CNCSerial::getDSR()
+{
+	return pDSR;
 }
 
 // RTS output lets the other device (CNC) know that we are ready to
@@ -224,6 +322,52 @@ int CNCSerial::getRTS()
 	return pRTS;
 }
 
+
+int CNCSerial::getUseRxFlowControl()
+{
+	return pUseRxFlowControl;
+}
+
+void CNCSerial::setUseRxFlowControl( int val )
+{
+	pUseRxFlowControl = (val & 0x01);
+}
+
+
+int CNCSerial::getUseStartStopChar()
+{
+	return pUseStartStopChar;
+}
+
+void CNCSerial::setUseStartStopChar( int val )
+{
+	pUseStartStopChar = val & 0x01;
+}
+
+unsigned char CNCSerial::getStartStopChar()
+{
+	return pStartStopChar;
+}
+
+void CNCSerial::setStartStopChar( unsigned char val )
+{
+	pStartStopChar = val;
+}
+		
+		
+
+
+unsigned long CNCSerial::getFileSize()
+{
+	return pFileSize;
+}
+
+
+unsigned long CNCSerial::getNumBytesSent()
+{
+	return pBytesSent;
+}
+		
 
 
 
@@ -245,6 +389,244 @@ void CNCSerial::resetStats()
 	pBytesSent = 0;
 }
 
+int CNCSerial::isStatusNew()
+{
+	return pStatusNew;
+}
+
+void CNCSerial::setStatus(char *text)
+{
+	sprintf(pStatus, "%s", text);
+	pStatusNew = 1;
+}
+
+char *CNCSerial::getStatus()
+{
+	pStatusNew = 0;
+	return pStatus;
+}
+	
+int CNCSerial::saveSettings(char *settingsFileName)
+{
+	//FIXME: add prefix to this as well
+	
+	//Save the settings to a XML file.
+	XMLParser savefile;
+	savefile.parseFile( settingsFileName );  //load and parse the existing file.
+	savefile.setValue("CNCSerial.Port.Name", pSerialName);
+	savefile.setValue("CNCSerial.Port.BaudRate", pBaudRate);
+	
+	switch(pDataBits)
+	{
+		case DATA_BITS_5: savefile.setValue("CNCSerial.Port.DataBits", "5"); break;
+		case DATA_BITS_6: savefile.setValue("CNCSerial.Port.DataBits", "6"); break;
+		case DATA_BITS_8: savefile.setValue("CNCSerial.Port.DataBits", "8"); break;
+		case DATA_BITS_7: 
+		default:
+						savefile.setValue("CNCSerial.Port.DataBits", "7"); break;
+	};
+	switch(pStopBits)
+	{
+		case STOP_BITS_1: savefile.setValue("CNCSerial.Port.StopBits", "1"); break;
+		case STOP_BITS_2: 
+		default:
+						savefile.setValue("CNCSerial.Port.StopBits", "2"); break;
+	};	
+	switch(pParity)
+	{
+		case PARITY_NONE:  savefile.setValue("CNCSerial.Port.Parity", "NONE"); break;
+		case PARITY_ODD:   savefile.setValue("CNCSerial.Port.Parity", "ODD"); break;
+		case PARITY_EVEN:  savefile.setValue("CNCSerial.Port.Parity", "EVEN"); break;
+	};
+	switch(pFlowControl)
+	{
+		case FLOW_CONTROL_NONE: 	savefile.setValue("CNCSerial.Port.FlowControl", "NONE"); break;
+		case FLOW_CONTROL_SOFTWARE: savefile.setValue("CNCSerial.Port.FlowControl", "SOFTWARE"); break;
+		case FLOW_CONTROL_HARDWARE: savefile.setValue("CNCSerial.Port.FlowControl", "HARDWARE"); break;
+		case FLOW_CONTROL_GRBL:		savefile.setValue("CNCSerial.Port.FlowControl", "GRBL"); break;
+	};
+	
+	savefile.setValue("CNCSerial.PacketLength", (int)pPacketLength);
+	savefile.setValue("CNCSerial.PacketDelay",  (int)pPacketDelay);
+	savefile.setValue("CNCSerial.UseRxFlowControl", (int)pUseRxFlowControl);
+	savefile.setValue("CNCSerial.UseStartStopChar", (int)pUseStartStopChar);
+	
+	char string[3];
+	sprintf(string, "%c", (char )pStartStopChar);
+	savefile.setValue("CNCSerial.StartStopChar", string);
+	
+	
+	switch(pXOFFByte)
+	{
+		case 0x93: savefile.setValue("CNCSerial.XOFFByte", "0x93"); break;
+		case 0x13:
+		default:
+			savefile.setValue("CNCSerial.XOFFByte", "0x13"); break;
+	};
+	savefile.save(settingsFileName);
+
+	return CNC_OK;
+}
+
+int CNCSerial::loadSettings(char *settingsFileName, char *prefix)
+{
+	//Read the settings from XML
+	std::string value;
+	char valuestr[32];	
+	char namestr[64];
+	XMLParser settingsfile;
+	settingsfile.parseFile(settingsFileName);
+	
+	settingsfile.printAll();
+	//settingsfile.save((char *)"./Files/temp.xml");//this is only for testing!
+
+	sprintf(namestr, "%s.Port.Name", prefix);
+	
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		strcpy(pSerialName, value.c_str());
+		log("Loaded Port: %s\n", pSerialName);
+	}
+	
+	sprintf(namestr, "%s.Port.BaudRate", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		
+		strcpy(valuestr, value.c_str());
+		pBaudRate = atoi(valuestr);
+		if(pBaudRate < 50)
+			pBaudRate = 50;
+		if(pBaudRate > 4000000)
+			pBaudRate = 4000000;
+		log("Loaded Baud: %d\n", pBaudRate);
+	}	
+	
+	sprintf(namestr, "%s.Port.DataBits", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		strcpy(valuestr, value.c_str());
+		int val = atoi(valuestr);
+		switch(val)
+		{
+			case 5: pDataBits = DATA_BITS_5; break;
+			case 6: pDataBits = DATA_BITS_6; break;
+			case 7: pDataBits = DATA_BITS_7; break;
+			case 8: pDataBits = DATA_BITS_8; break;
+			default:
+				pDataBits = DATA_BITS_7; break;
+		};			
+		log("Loaded DataBits: %d\n", val);
+	}
+	
+	sprintf(namestr, "%s.Port.StopBits", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		strcpy(valuestr, value.c_str());
+		int val = atoi(valuestr);
+		switch(val)
+		{
+			case 1: pStopBits = STOP_BITS_1; break;
+			case 2: pStopBits = STOP_BITS_2; break;
+			default:
+				pStopBits = STOP_BITS_2; break;
+		};			
+		log("Loaded StopBits: %d\n", val);
+	}
+	
+	sprintf(namestr, "%s.Port.Parity", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		if(value.find("NONE") != std::string::npos)
+			pParity = PARITY_NONE;
+		if(value.find("ODD") != std::string::npos)
+			pParity = PARITY_ODD;
+		if(value.find("EVEN") != std::string::npos)
+			pParity = PARITY_EVEN;		
+		log("Loaded Parity: %s\n", value.c_str());
+	}	
+	
+	sprintf(namestr, "%s.Port.FlowControl", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		if(value.find("NONE") != std::string::npos)
+		{
+			pFlowControl  = pNewFlowControl = FLOW_CONTROL_NONE;
+		}
+		if(value.find("SOFT") != std::string::npos)
+		{
+			pFlowControl = pNewFlowControl = FLOW_CONTROL_SOFTWARE;
+		}
+		if(value.find("HARD") != std::string::npos)
+		{
+			pFlowControl = pNewFlowControl = FLOW_CONTROL_HARDWARE;
+		}
+		if(value.find("GRBL") != std::string::npos)
+		{
+			pFlowControl = pNewFlowControl = FLOW_CONTROL_GRBL;
+		}
+		log("Loaded FlowControl: %s\n", value.c_str());		
+	}	
+	
+	sprintf(namestr, "%s.PacketLength", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		strcpy(valuestr, value.c_str());
+		pPacketLength = atoi(valuestr);
+		if(pPacketLength < 0)
+			pPacketLength = 0;
+		if(pPacketLength > 10000)
+			pPacketLength = 10000;
+		log("Loaded PacketLength: %d\n", pPacketLength);
+	}	
+
+	sprintf(namestr, "%s.PacketDelay", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	if(value.length() > 0)
+	{
+		strcpy(valuestr, value.c_str());
+		pPacketDelay = atoi(valuestr);
+		if(pPacketDelay < 0)
+			pPacketDelay = 0;
+		if(pPacketDelay > 10000)
+			pPacketDelay = 10000;
+		log("Loaded PacketDelay: %d\n", pPacketDelay);
+	}		
+	
+	sprintf(namestr, "%s.XOFFByte", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	{
+		if(value.find("93") != std::string::npos)
+			pXOFFByte = XOFF2;  //0x93
+		else
+			pXOFFByte = XOFF;  //0x13
+	}
+	
+	sprintf(namestr, "%s.UseRxFlowControl", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	strcpy(valuestr, value.c_str());
+	pUseRxFlowControl = atoi(valuestr) & 0x01;
+	
+	sprintf(namestr, "%s.UseStartStopChar", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	strcpy(valuestr, value.c_str());
+	pUseStartStopChar = atoi(valuestr) & 0x01;
+	
+	sprintf(namestr, "%s.StartStopChar", prefix);
+	value = settingsfile.findValue((char *)namestr);
+	pStartStopChar = (unsigned char)value[0];
+	
+	return CNC_OK;
+}
+
+
+
 void CNCSerial::printStatus()
 {
 	if( (serial_fd > 0))
@@ -260,12 +642,15 @@ void CNCSerial::printStatus()
 		log("Flow Control: Software\r\n");
 	else if(pFlowControl == FLOW_CONTROL_HARDWARE)
 		log("Flow Control: Hardware\r\n");
+	else if(pFlowControl == FLOW_CONTROL_GRBL)
+		log("Flow Control: GRBL\r\n");
 	else if(pFlowControl == FLOW_CONTROL_NONE)
 		log("Flow Control: None\n");
 			
 	log("RTS: %d (%d)\n", pRTS, pNewRTS);
 	log("DTR: %d (%d)\n", pDTR, pNewDTR);
 	log("CTS: %d\n", pClearToSend);
+	log("DSR: %d (%d)\n", pDSR, pNewDSR);
 
 	log("Bytes RX    : %u\r\n", pBytesReceived);
 	log("Bytes TX    : %u\r\n", pBytesSent);
@@ -280,6 +665,13 @@ void CNCSerial::printStatus()
 						
 }
 
+void CNCSerial::clearQueues()
+{
+	txData.reset();
+	rxData.reset();
+	pBytesSent = 0;
+	pBytesReceived = 0;
+}
 
 int CNCSerial::send(unsigned char *txdata, int length)  //Public
 {
@@ -315,6 +707,22 @@ int CNCSerial::rxBytesWaiting()
 	return 0;  //port is closed, no data
 }
 
+
+int CNCSerial::getRxQueueSize()  //from the queue
+{
+	return rxData.getSize();
+}
+
+unsigned char CNCSerial::getRxQueueByte()  //from the queue
+{
+	//get the data off the queue
+	unsigned char byte;
+	int n = rxData.getData( &byte, 1 );
+	if(n == 1)
+		return byte;
+	return 0;
+}
+
 int CNCSerial::getCTS()
 {
 	return pClearToSend;
@@ -332,7 +740,7 @@ int CNCSerial::getPauseButton()
 	return pStartPauseButton;
 }
 	
-int CNCSerial::startThreads()
+int CNCSerial::startThreads(int useButtonThread)
 {
 	Timers timeout;
 	
@@ -341,7 +749,7 @@ int CNCSerial::startThreads()
 		log("Error: calling startThreads() but the serial thread already exists.\n");
 		return CNC_ERROR;   //the thread already exists.
 	}
-	if(buttonthread != 0)
+	if((useButtonThread != 0) && (iothread != 0))
 	{
 		log("Error: calling startThreads() but the button thread already exists.\n");
 		return CNC_ERROR;
@@ -355,23 +763,26 @@ int CNCSerial::startThreads()
 	{
 		usleep(1000); //delay a ms
 		//delay here, but include a timeout
-		if(timeout.Expired(SERIAL_1S_TIMEOUT))
+		if(timeout.Expired(TIMER_5S_TIMEOUT))
 		{
-			log("Error: Timeout (%dms) waiting for serial thread to start.\n", SERIAL_1S_TIMEOUT);				
+			log("Error: Timeout (%dms) waiting for serial thread to start.\n", TIMER_5S_TIMEOUT);				
 			return CNC_TIMEOUT;
 		}
 	}
 	
-	buttonthread = new std::thread(&CNCSerial::buttonPollingThread, this);
-	timeout.Start();
-	while(!pButtonThreadRunning)
+	if(useButtonThread)
 	{
-		usleep(1000);
-		//delay here, but include a timeout
-		if(timeout.Expired(SERIAL_1S_TIMEOUT))
+		iothread = new std::thread(&CNCSerial::ioPollingThread, this);
+		timeout.Start();
+		while(!pIOThreadRunning)
 		{
-			log("Error: Timeout (%dms) waiting for button thread to start.\n", SERIAL_1S_TIMEOUT);
-			return CNC_TIMEOUT;
+			usleep(1000);
+			//delay here, but include a timeout
+			if(timeout.Expired(TIMER_5S_TIMEOUT))
+			{
+				log("Error: Timeout (%dms) waiting for button thread to start.\n", TIMER_5S_TIMEOUT);
+				return CNC_TIMEOUT;
+			}
 		}
 	}
     
@@ -392,7 +803,7 @@ int CNCSerial::stopThreads()
 				usleep(1000);  //wait 1 millisecond
 			}
 			log("Stopping Button thread.\n");
-			while(pButtonThreadRunning)
+			while(pIOThreadRunning)
 			{
 				usleep(1000); //wait 1 millisecond
 			}
@@ -403,20 +814,21 @@ int CNCSerial::stopThreads()
 			delete serialthread;
 		}
 		
-		if(buttonthread)
+		if(iothread)
 		{
-			buttonthread->join();  //wait for it to complete.
-			delete buttonthread;
+			iothread->join();  //wait for it to complete.
+			delete iothread;
 		}
 		
 		serialthread = 0;
-		buttonthread = 0;
+		iothread = 0;
 	}
 	catch (const std::exception& e)
 	{
 		log("Error. stopThread() Caught exception: %s\n", e.what());
 	}
 	
+	log("Threads stopped.\n");
 	return CNC_OK;
 }
 
@@ -429,6 +841,7 @@ int CNCSerial::receiveFile(char *filename)
 	{
 		strcpy(inFileName, filename);
 		pStartReceivingFile = 1;
+		pStopReceivingFile = 0;
 		if(!pSerialThreadRunning)
 		{
 			log("Warning: set to recieve file, but serial thread is not running. Call startThread();\n");
@@ -441,9 +854,9 @@ int CNCSerial::receiveFile(char *filename)
 			{
 				//delay here, but include a timeout
 				usleep(1000); //wait a ms
-				if(timeout.Expired(SERIAL_1S_TIMEOUT))
+				if(timeout.Expired(TIMER_1S_TIMEOUT))
 				{
-					log("Error: Timeout (%dms) waiting for serial thread to start receiving file.\n", SERIAL_1S_TIMEOUT);
+					log("Error: Timeout (%dms) waiting for serial thread to start receiving file.\n", TIMER_1S_TIMEOUT);
 					
 					return CNC_TIMEOUT;
 				}
@@ -476,9 +889,9 @@ void CNCSerial::stopReceiveFile()
 		{
 			usleep(1000); //wait a ms
 			//delay here, but include a timeout
-			if(timeout.Expired(SERIAL_1S_TIMEOUT))
+			if(timeout.Expired(TIMER_1S_TIMEOUT))
 			{
-				log("Error: Timeout (%dms) waiting for serial thread to stop receiving file.\n", SERIAL_1S_TIMEOUT);
+				log("Error: Timeout (%dms) waiting for serial thread to stop receiving file.\n", TIMER_1S_TIMEOUT);
 				return;
 			}
 		}
@@ -505,9 +918,9 @@ void CNCSerial::stopSendFile()
 		{
 			//delay here, but include a timeout
 			usleep(1000); //wait a ms
-			if(timeout.Expired(SERIAL_1S_TIMEOUT))
+			if(timeout.Expired(TIMER_1S_TIMEOUT))
 			{
-				log("Error: Timeout (%dms) waiting for serial thread to stop sending file.\n", SERIAL_1S_TIMEOUT);
+				log("Error: Timeout (%dms) waiting for serial thread to stop sending file.\n", TIMER_1S_TIMEOUT);
 				return;
 			}
 		}
@@ -527,7 +940,10 @@ int CNCSerial::sendFile(char *filename)
 
 		log("Send File: %s\n", filename);
 		strcpy(outFileName, filename);
+		
 		pStartSendingFile = 1;
+		pStopSendingFile = 0;
+		
 		if(!pSerialThreadRunning)
 		{
 			log("Warning: set to send file, but serial thread is not running. Call startThread() first.\n");
@@ -540,9 +956,9 @@ int CNCSerial::sendFile(char *filename)
 			{
 				//delay here, but include a timeout
 				usleep(1000); //wait a ms
-				if(timeout.Expired(SERIAL_1S_TIMEOUT))
+				if(timeout.Expired(TIMER_1S_TIMEOUT))
 				{
-					log("Error: Timeout (%dms) waiting for serial thread to start sending file.\n", SERIAL_1S_TIMEOUT);				
+					log("Error: Timeout (%dms) waiting for serial thread to start sending file.\n", TIMER_1S_TIMEOUT);				
 					return CNC_TIMEOUT;
 				}
 			}
@@ -560,9 +976,8 @@ int CNCSerial::sendString(char *str)
 	Timers timeout;
 	if(!pSendingFile )
 	{
-		log("Send String: %s\n", filename);
-		strcpy(outFileName, filename);
-		//pStartSendingFile = 1;
+		log("Send String: [%s]\n", str);
+
 		if(!pSerialThreadRunning)
 		{
 			log("Warning: set to send string, but serial thread is not running. Call startThread() first.\n");
@@ -570,7 +985,7 @@ int CNCSerial::sendString(char *str)
 		else
 		{
 			//Simply add the string to the output queue
-			if(txData.putData(str, strlen(str)) == CIRC_QUEUE_FULL)  //however many bytes we have, put them on the queue.
+			if(txData.putData((unsigned char *)str, strlen(str)) == CIRC_QUEUE_FULL)  //however many bytes we have, put them on the queue.
 			{
 				log("Error. sendString() filled up TX queue.\n");
 			}
@@ -607,6 +1022,11 @@ void CNCSerial::setLogMode( int value )
 	pLogMode = value;
 }
 
+void CNCSerial::reopen()
+{
+	pReopen = 1;
+}
+
 //*****************************************************************************************************
 //									Private Functions
 //*****************************************************************************************************
@@ -616,11 +1036,26 @@ int CNCSerial::serialOpen() // Open the serial port in read-write mode
 	struct termios options;
 	//close(serial_fd);  //just in case the user calls open twice
 	
-    serial_fd = open(SERIAL_PORT, O_RDWR | O_NOCTTY | O_NONBLOCK);// | O_NDELAY
+	if(strstr(pSerialName, "/dev/") == 0)
+	{
+		log("Serial Name is not valid. Defaulting.\n");
+		strcpy( pSerialName, SERIAL_PORT);		
+	}
+	
+	if(serial_fd != 0)
+	{
+		log("serialOpen: Closing Serial Port.\n");
+		
+		close(serial_fd);
+		serial_fd = 0;
+		usleep(100);  //wait 10uS
+	}
+		
+    serial_fd = open(pSerialName, O_RDWR | O_NOCTTY | O_NONBLOCK);// | O_NDELAY
     if (serial_fd < 0) 
 	{
         //perror("Error opening serial port");
-		log("Error opening serial port.\r\n");
+		log("Error opening serial port.\n");
         //exit(EXIT_FAILURE);
 		//open = 0;
 		return CNC_ERROR;
@@ -638,7 +1073,7 @@ int CNCSerial::serialOpen() // Open the serial port in read-write mode
 	//		log("Serial port is already locked by another process.\n");
     //}
 
-	log("Starting Serial [%s]: %d baud, ", SERIAL_PORT, pBaudRate);
+	log("Starting Serial [%s]: %d baud, ", pSerialName, pBaudRate);
 	
 	if(pParity == PARITY_EVEN)
 	{
@@ -669,6 +1104,10 @@ int CNCSerial::serialOpen() // Open the serial port in read-write mode
 	else if(pFlowControl == FLOW_CONTROL_HARDWARE)
 	{
 		log("Hardware Flow Control\n");
+	}
+	else if(pFlowControl == FLOW_CONTROL_GRBL)
+	{
+		log("GRBL Flow Control\n");
 	}
 	else if(pFlowControl == FLOW_CONTROL_NONE)
 	{
@@ -729,8 +1168,25 @@ int CNCSerial::serialOpen() // Open the serial port in read-write mode
 	
 	options.c_cflag |= (CLOCAL | CREAD);  //CLOCAL: Ignore modem control lines.  CREAD enables RX 
 	options.c_cflag &= ~CSIZE;		//zero out the size mask
-	options.c_cflag |= CS7;			//set the number of data bits (Values are CS5, CS6, CS7, or CS8)
-    
+	
+	if(pDataBits == 5)
+	{
+		options.c_cflag |= CS5;
+	}
+	else if(pDataBits == 6)
+	{
+		options.c_cflag |= CS6;
+	}
+	else if(pDataBits == 7)
+	{
+		options.c_cflag |= CS7;			//set the number of data bits (Values are CS5, CS6, CS7, or CS8)
+	}
+	else //if(pDataBits == 8)
+	{
+		options.c_cflag |= CS8;
+	}
+
+		
 	if(pParity)
 	{
 		options.c_cflag |= PARENB;		//Enable parity generation on output and parity checking for input
@@ -749,17 +1205,18 @@ int CNCSerial::serialOpen() // Open the serial port in read-write mode
 	}
 	
 	
-	if(pStopBits == STOP_BITS_1)
-	{
-		options.c_cflag &= ~CSTOPB;		//clear flag means 1 stop bit
-	}
-	else if(pStopBits == STOP_BITS_2)
+	if(pStopBits == STOP_BITS_2)
 	{
 		options.c_cflag |= CSTOPB;		//Set flag means two stop bits, rather than one.
 	}
+	else if(pStopBits == STOP_BITS_1)
+	{
+		options.c_cflag &= ~CSTOPB;		//clear flag means 1 stop bit
+	}
 	else
 	{
-		//error("Stop bits are not set before calling open()");
+		log("Error: Stop bits are not set before calling open()");
+		options.c_cflag &= ~CSTOPB;		//clear flag means 1 stop bit
 	}
 	
 	if(pNewFlowControl != pFlowControl)
@@ -771,7 +1228,7 @@ int CNCSerial::serialOpen() // Open the serial port in read-write mode
 	{
 		options.c_cflag |= CRTSCTS;		//Enable RTS/CTS (hardware) flow control.
 	}
-	else if((pFlowControl == FLOW_CONTROL_SOFTWARE) || (pFlowControl == FLOW_CONTROL_NONE))
+	else //if((pFlowControl == FLOW_CONTROL_SOFTWARE) || (pFlowControl == FLOW_CONTROL_NONE) || (pFlowControl == FLOW_CONTROL_GRBL))
 	{
 		options.c_cflag &= ~CRTSCTS;     // Disable hardware flow control
 	}
@@ -894,6 +1351,44 @@ int CNCSerial::actualSetRTS(unsigned short level)  //Private
 	return CNC_OK;
 }
 
+int CNCSerial::actualSetDSR(unsigned short level)  //Private
+{
+	int status;
+	
+	if (serial_fd < 0) 
+	{
+		log("Error: Invalid File descriptor in actualSetDSR().\n");
+		return CNC_ERROR;
+	}
+
+	if (ioctl(serial_fd, TIOCMGET, &status) == -1) 
+	{
+		log("Error: actualSetRTS(): TIOCMGET\n");
+		return CNC_ERROR;
+	}
+
+	if (level) 
+	{
+		status |= TIOCM_DSR;
+		status |= TIOCM_LE;  //line enable is DSR
+	}
+	else 
+	{
+		status &= ~TIOCM_DSR;
+		status &= ~TIOCM_LE;
+	}
+
+	if (ioctl(serial_fd, TIOCMSET, &status) == -1) 
+	{
+		log("Error: set_DSR(): TIOCMSET\n");
+		return CNC_ERROR;
+	}
+	log("Setting DSR to: %d\n", level);
+	pDSR = level;
+	
+	return CNC_OK;
+}
+
 
 int CNCSerial::actualSetFlowControl(FlowControlValues value)  //FLOW_CONTROL_SOFTWARE, FLOW_CONTROL_HARDWARE, or FLOW_CONTROL_NONE
 {
@@ -908,10 +1403,18 @@ int CNCSerial::actualSetFlowControl(FlowControlValues value)  //FLOW_CONTROL_SOF
 		//options.c_cflag &= ~CRTSCTS;     // Disable hardware flow control
 		//options.c_iflag |= (IXON | IXOFF | IXANY);  //enable XON/XOFF on output  FIXME: may not need IXOFF or IXANY
 	}
+	else if(value == FLOW_CONTROL_GRBL)
+	{
+		//Do nothing.  We only receive flow control 'ok\r\n' or 'error\r\n'
+	}
 	else if(value == FLOW_CONTROL_HARDWARE)
 	{
 		options.c_cflag |= CRTSCTS;		//Enable RTS/CTS (hardware) flow control
 		options.c_iflag &= ~(IXON | IXOFF | IXANY); // Turn off s/w flow ctrl
+	}
+	else if(value == FLOW_CONTROL_NONE)
+	{
+		//Do nothing
 	}
 	pFlowControl = value;
     // Get the serial port parameters
@@ -954,7 +1457,7 @@ int CNCSerial::actualSetDTR( unsigned short level)  //0 or non-zero
 }
 
 
-int CNCSerial::buttonPollingThread()
+__attribute__((weak)) int CNCSerial::ioPollingThread()
 {
 	SerialLEDStates LED_state;
 	Timers led_timer;
@@ -972,6 +1475,7 @@ int CNCSerial::buttonPollingThread()
 	
 	try
 	{
+		
 		//initialize the GPIO
 		/////////
 		wiringPiSetup();  //this sets up the GPIO driver using pin numbers, not GPIO numbers.
@@ -980,9 +1484,11 @@ int CNCSerial::buttonPollingThread()
 		pinMode(SERIAL_STOP_PIN, INPUT);
 		//////////
 
-		pButtonThreadRunning = 1;
+		pIOThreadRunning = 1;
 		while(!pDone)
 		{
+			usleep(10);  //wait 10uS
+			
 			if(pUserPaused)
 				LED_state = SERIAL_LED_BLINKING;
 			else if(!pClearToSend)
@@ -1016,28 +1522,23 @@ int CNCSerial::buttonPollingThread()
 			}
 			if((pStartPauseButton == 1) && (last_start_pause_button == 0))
 			{
-				//active edge!  toggle the pUserPaused flag
-				pUserPaused++;
-				pUserPaused &= 0x01;
-				
-				log("Start/Pause button pressed!  pUserPaused=%d\n", pUserPaused);
 
-				if(!pSendingFile && pFlowControl == FLOW_CONTROL_SOFTWARE)
+				log("SingleStep: %d\n", pSingleStep);
+				if(pSingleStep)
 				{
-					unsigned char fc[3] = { XON, XOFF, 0x00 };
-					printf("Sending Flow control: %x\n", fc[pUserPaused]);
-
-					if(pUserPaused == 1)
-						txData.putData(&fc[1], 1);
-					else
-						txData.putData(&fc[0], 1); 
+					pDoStep = 1;
+					pUserPaused = 0;  //we are doing single step, so shut off the paused.
 				}
-				if(pFlowControl == FLOW_CONTROL_HARDWARE)
+				else
 				{
-					if(pUserPaused == 1)
-						setRTS(0);
-					else
-						setRTS(1);
+					//active edge!  toggle the pUserPaused flag
+					pUserPaused++;
+					pUserPaused &= 0x01;
+					
+					log("Start/Pause button pressed!  pUserPaused=%d\n", pUserPaused);
+					
+					pStartPauseButtonFlag = 1;  //handle this in the Serial Thread
+					
 				}
 			}
 			else if((pStartPauseButton == 0) && (last_start_pause_button == 1))
@@ -1067,9 +1568,8 @@ int CNCSerial::buttonPollingThread()
 			if((pStopButton == 1) && (last_stop_button == 0))
 			{
 				//active edge!  set flags to stop all transmission and reception
-				pStopSendingFile = 1;
-				pStopReceivingFile = 1; 
-				log("Stop button pressed! Stopping sending and receiving.\n");
+				pStopButtonFlag = 1;		
+				//handle this in the Serial Thread
 			}
 			else if((pStopButton == 0) && (last_stop_button == 1))
 			{
@@ -1119,7 +1619,7 @@ int CNCSerial::buttonPollingThread()
 		log("Error. Button Thread caught exception: %s\n", e.what());
 	}	
 		
-	pButtonThreadRunning = 0;
+	pIOThreadRunning = 0;
 	return CNC_OK;
 }
 
@@ -1133,18 +1633,19 @@ int CNCSerial::serialPollingThread()
 	int in_file_fd = 0;  //for receiving a file
 	int out_file_fd = 0;  //for transmitting file
 	Timers delay_timer;
+	Timers GRBLtimeout;
 
 	
 	int end_of_file = 0;
 	
-	int rx_data_active = 0;  //gets set when we receive a 0x12 (Start of Data)
+	int rx_data_active = 0;  //gets set when we receive a 0x12 (Start of Data) or when  we get StartStopChar
 	
 	
 
 	int tx_log_fd = 0;
 	if(pLogTx)
 	{
-		tx_log_fd = open("TXlog.txt", O_CREAT|O_RDWR, 0666);  //read and write permissions (octal)
+		tx_log_fd = open("./Logs/TXlog.txt", O_CREAT|O_RDWR, 0666);  //read and write permissions (octal)
 		if (tx_log_fd <= 0) 
 		{
 			log("Error opening %s to log. Does it exist already?\n", "TXlog.txt");
@@ -1155,16 +1656,16 @@ int CNCSerial::serialPollingThread()
 	int rx_log_fd = 0;
 	if(pLogRx)
 	{
-		rx_log_fd = open("RXlog.txt", O_CREAT|O_RDWR, 0666);  //read and write permissions (octal)
+		rx_log_fd = open("./Logs/RXlog.txt", O_CREAT|O_RDWR, 0666);  //read and write permissions (octal)
 		if (rx_log_fd <= 0) 
 		{
 			log("Error opening %s to log. Does it exist already?\n", "RXlog.txt");
 			log("Error %d, description is : %s\n",errno, strerror(errno));
 		}	
-		else if(rx_log_fd > 0)
-		{
-			write(rx_log_fd, "RXLog\n", 6);  //write something so we know the log is working.
-		}
+		//else if(rx_log_fd > 0)
+		//{
+		//	write(rx_log_fd, "RXLog\n", 6);  //write something so we know the log is working.
+		//}
 	}
 		
 
@@ -1185,10 +1686,15 @@ int CNCSerial::serialPollingThread()
 		actualSetFlowControl(pFlowControl);
 		
 		delay_timer.Start();
+		GRBLtimeout.Start();
 
 		actualSetFlowControl( pNewFlowControl );
 		actualSetDTR( pNewDTR );
 		actualSetRTS( pNewRTS );
+		actualSetDSR( pNewDSR );
+		
+		pGRBLReplyIndex = 0;
+		pGRBLNextFlag = 1;  //make it OK to send a GRBL command.
 				
 		
 		pSerialThreadRunning = 1;
@@ -1198,6 +1704,23 @@ int CNCSerial::serialPollingThread()
 			usleep(10);  //wait 10uS
 			//log("*");
 			
+			if(pReopen == 1)
+			{
+				pReopen = 0;
+				if(serialOpen() == CNC_ERROR)
+				{
+					log("Error: Unable to open serial port.\n");					
+				}
+			}
+			if(pFlowControl == FLOW_CONTROL_GRBL)
+			{
+				if(GRBLtimeout.Expired(10000))  //10 seconds
+				{
+					log("GRBL 10s timeout. Enabling TX again.\n");
+					pGRBLNextFlag = 1;  //make it OK to send a GRBL command. again.
+					GRBLtimeout.Start();
+				}
+			}
 			//*************************************************************************************
 			//manage Port settings 
 			//*************************************************************************************
@@ -1213,9 +1736,58 @@ int CNCSerial::serialPollingThread()
 			{
 				actualSetRTS( pNewRTS );
 			}
-
-						
+			else if(pNewDSR != pDSR)
+			{
+				actualSetDSR( pNewDSR);
+			}
+			
+				
+			if(serial_fd == 0)
+				continue;
 		
+			if(pStopButtonFlag)
+			{
+				pStopButtonFlag = 0;
+				
+				pStopSendingFile = 1;
+				pStopReceivingFile = 1; 
+				log("Stop button pressed! Stopping sending and receiving.\n");
+			}
+			if(pStartPauseButtonFlag)
+			{
+				pStartPauseButtonFlag = 0;
+				
+				if(pSingleStep)
+				{
+					pDoStep = 1;
+				}
+				else
+				{
+					if(pUserPaused == 0)
+						pUserPaused = 1;
+					else
+						pUserPaused = 0;
+				
+					
+					if(!pSendingFile && (pFlowControl == FLOW_CONTROL_SOFTWARE))  
+					{
+						unsigned char fc[3] = { XON, XOFF, 0x00 };
+						printf("Sending Flow control: %x\n", fc[pUserPaused]);
+
+						if(pUserPaused == 1)
+							txData.putData(&fc[1], 1);
+						else
+							txData.putData(&fc[0], 1); 
+					}
+					if(pFlowControl == FLOW_CONTROL_HARDWARE)
+					{
+						if(pUserPaused == 1)
+							setRTS(0);
+						else
+							setRTS(1);
+					}				
+				}	
+			}
 			
 			//*************************************************************************************
 			//manage RX 
@@ -1223,91 +1795,169 @@ int CNCSerial::serialPollingThread()
 			num_bytes = rxBytesWaiting();
 			if(num_bytes > 0)
 			{
-					//num_bytes = receive( inbuf, sizeof(inbuf));  //this already handles SW flow control
-					num_bytes = read(serial_fd, inbuf, sizeof(inbuf));
+				//num_bytes = receive( inbuf, sizeof(inbuf));  //this already handles SW flow control
+				num_bytes = read(serial_fd, inbuf, sizeof(inbuf));
+				
+				pBytesReceived += num_bytes;
+				
+				char str[50];
+				
+				//Handle all Flow Control Bytes before queuing up the data
+				int count = 0;
+				for(int n = 0; n < num_bytes; n++)
+				{
 					
-					pBytesReceived += num_bytes;
-					
-					char str[50];
-					
-					//Handle all Flow Control Bytes before queuing up the data
-					int count = 0;
-					for(int n = 0; n < num_bytes; n++)
+					if(pLogRx && (rx_log_fd != 0))
 					{
-						
-						if(pLogRx && (rx_log_fd != 0))
+						sprintf(str, "RX: %02x\n", inbuf[n]);
+						write(rx_log_fd, str, 8);
+					}
+					
+					switch(inbuf[n])
+					{
+						case 0x00: //only add 0x00 to queue if ignoreNULL is 0.
 						{
-							sprintf(str, "RX: %02x\n", inbuf[n]);
-							write(rx_log_fd, str, 7);
-						}
-						
-						switch(inbuf[n])
+							if((!pIgnoreNULL) && (rx_data_active))
+								inbuf2[count++] = inbuf[n];
+						}break;
+						case XON:  //DC1 (sent by CNC to start data xfer)
 						{
-							case 0x00: //only add 0x00 to queue if ignoreNULL is 0.
+
+							if(pFlowControl == FLOW_CONTROL_SOFTWARE)
 							{
-								if((!pIgnoreNULL) && (rx_data_active))
-									inbuf2[count++] = inbuf[n];
-							}break;
-							case XON:  //DC1 (sent by CNC to start data xfer)
+								pClearToSend = 1;
+							} 
+							else if(pFlowControl == FLOW_CONTROL_HARDWARE)
 							{
-								if(pFlowControl == FLOW_CONTROL_SOFTWARE)
-								{
-									pClearToSend = 1;
-								} 
-								else if(pFlowControl == FLOW_CONTROL_HARDWARE)
-								{
-									pMachinePaused = 0;	
-								}
-							}break;
-							case XOFF:  //DC2 (sent by CNC to pause data xfer)
-							case XOFF2: 
+								pMachinePaused = 0;	
+							}
+							if((pUseRxFlowControl == 0) && (pReceivingFile == 1))
 							{
-								if(pFlowControl == FLOW_CONTROL_SOFTWARE)
-								{
-									pClearToSend = 0;
-								}
-								else if(pFlowControl == FLOW_CONTROL_HARDWARE)
-								{
-									pMachinePaused = 1;
-								}
-							}break;
-							case DC2:  //start of data
+								log("Warning: Use RX Flow control disabled, but the machine sent SW flow control bytes");
+							}
+							
+						}break;
+						case XOFF:  //DC3 (sent by CNC to pause data xfer)
+						case XOFF2: 
+						{
+							if(pFlowControl == FLOW_CONTROL_SOFTWARE)
+							{
+								pClearToSend = 0;
+							}
+							else if(pFlowControl == FLOW_CONTROL_HARDWARE)  //FIXME: does this make sense?
+							{
+								pMachinePaused = 1;
+							}
+							if((pUseRxFlowControl == 0) && (pReceivingFile == 1))
+							{
+								log("Warning: Use RX Flow control disabled, but the machine sent SW flow control bytes");
+							}
+						}break;
+						case DC2:  //start of data
+						{
+							if(pReceivingFile && !pUseStartStopChar)
 							{
 								rx_data_active = 1;
-							}break;
-							case DC4:  //end of data
+								log("Recieved SW Start byte. Receiving File.");
+							}
+							
+						}break;
+						case DC4:  //end of data
+						{
+							if(pReceivingFile)
 							{
 								rx_data_active = 0;
 								pStopReceivingFile = 1;
-							}break;
-							//NAK is sent when there is an Alarm during the transfer
-							case NAK:
-							case NAK2: 
-							{
-								pStopSendingFile = 1; 
-							}break;
-							//SYN is sent when there is a Reset during the transfer
-							case SYN:
-							case SYN2: 
-							{
-								pStopSendingFile = 1; 
-							}break;
-							default:  //everything else
-							{
-								if(rx_data_active)
-									inbuf2[count++] = inbuf[n];
-							}break;
-						}
-					}//end for	
-					//log("Received: %d\n", num_bytes);
-					//add inbuf data to the circular queue
-					if(count > 0)
-					{
-						if(rxData.putData(inbuf2, count) == CIRC_QUEUE_FULL)
+							}
+						}break;
+						//NAK is sent when there is an Alarm during the transfer
+						case NAK:
+						case NAK2: 
 						{
-							log("Error. RX Queue full.\n");
-						}
+							pStopSendingFile = 1; 
+						}break;
+						//SYN is sent when there is a Reset during the transfer
+						case SYN:
+						case SYN2: 
+						{
+							pStopSendingFile = 1; 
+						}break;
+						default:  //everything else
+						{
+							if(pUseStartStopChar)
+							{
+								if(inbuf[n] == pStartStopChar)
+								{
+									if(rx_data_active == 1)
+									{
+										rx_data_active = 0;
+										inbuf2[count++] = inbuf[n];  //save the last char to the file, typically '%'
+										pStopReceivingFile = 1;
+										log("Got second StartStopChar. Stopping RX.");
+									}
+									else
+									{
+										rx_data_active = 1;
+										log("Received start char. Receiving File.");
+									}
+								}
+							}
+							if(pFlowControl == FLOW_CONTROL_GRBL)
+							{
+								printf("%c", inbuf[n]);
+								if(inbuf[n] == '\n')
+								{
+									if(pGRBLReplyIndex >= 2)
+									{
+										//check for 'ok\r\n'
+										if((pGRBLReply[pGRBLReplyIndex-2] == 'o') && (pGRBLReply[pGRBLReplyIndex-1] == 'k'))
+										{											
+											pGRBLNextFlag = 1;
+											printf("OK!\n");
+										}
+										//check for 'ok\n'
+										else if((pGRBLReply[pGRBLReplyIndex-1] == 'o') && (pGRBLReply[pGRBLReplyIndex] == 'k'))
+										{											
+											pGRBLNextFlag = 1;
+											printf("OK!\n");
+										}
+										else
+										{
+											printf("ERROR\n");
+											//we must have gotten an error..
+											pGRBLReply[pGRBLReplyIndex++] = '\0';
+											log(pGRBLReply);  //
+										}
+									}
+									//print this out for initial developement testing
+									pGRBLReply[pGRBLReplyIndex++] = '\0';
+									log("GRBL Reply: %s\n", pGRBLReply);  //
+									pGRBLReplyIndex = 0;
+								}
+								else
+								{
+									pGRBLReply[pGRBLReplyIndex++] = inbuf[n];
+								}
+							}
+							
+							if(rx_data_active)
+								inbuf2[count++] = inbuf[n];
+
+						}break;
 					}
+				}//end for	
+				//log("Received: %d\n", num_bytes);
+				//add inbuf data to the circular queue
+				if(count > 0)
+				{
+					if(rxData.putData(inbuf2, count) == CIRC_QUEUE_FULL)
+					{
+						log("Error. RX Queue full.\n");
+					}
+				}
+				
+				//TODO:  if Software flow control and our buffers filled up, send stop byte (pXOFFByte)
+				//TODO:  if software flow control and stopped and buffers empty, send start byte (DC1)
 			}
 			
 			//*************************************************************************************
@@ -1330,12 +1980,51 @@ int CNCSerial::serialPollingThread()
 					//write(in_file_fd, "FirstLine.\n", 11);  //write this to test the file
 					pReceivingFile = 1;
 					
-					if(pFlowControl == FLOW_CONTROL_SOFTWARE)
+					if(pUseRxFlowControl)
 					{
-						sendByte( XON );
-						//unsigned char byte = XON;
-						//write(serial_fd, &byte, 1);
-						//tcdrain(serial_fd);
+						if(pFlowControl == FLOW_CONTROL_SOFTWARE)
+						{
+							sendByte( XON );
+							//unsigned char byte = XON;
+							//write(serial_fd, &byte, 1);
+							//tcdrain(serial_fd);
+							log("Receiving file with Software Flow Control.");
+						}
+						else if(pFlowControl == FLOW_CONTROL_GRBL)
+						{
+							if(!pUseStartStopChar)
+							{
+								rx_data_active = 1;
+							}
+							log("Receiving file with GRBL Flow Control.");
+						}
+						else if(pFlowControl == FLOW_CONTROL_HARDWARE)
+						{
+							if(!pUseStartStopChar)  
+							{
+								rx_data_active = 1;
+							}
+							log("Receiving with Hardware Flow Control.");
+							
+						}
+						else //FLOW_CONTROL_NONE
+						{
+							if(!pUseStartStopChar)
+							{
+								rx_data_active = 1;
+							}
+							log("Receiving file using no Flow Control.");
+							
+						}
+					}
+					else
+					{
+						if(!pUseStartStopChar)  //if not using the character
+						{
+							rx_data_active = 1;
+							log("Not using RX Flow Control. Receiving now.");
+						}
+						//if we are using the start stop char, the rx_data_active will get set when it is received.
 					}
 					
 				}			
@@ -1366,8 +2055,6 @@ int CNCSerial::serialPollingThread()
 							log("Error %d, description is : %s\n",errno, strerror(errno));
 						}
 						
-						
-						//TODO: if we time-out or if CTS goes low, then close the file
 					}
 					else
 					{
@@ -1401,32 +2088,77 @@ int CNCSerial::serialPollingThread()
 			if(pStartSendingFile)  //we would like to open a file and start sending it.
 			{
 				pStartSendingFile = 0; //turn off the flag since we are servicing it.
+				
+					//first, find the file size
+				//FILE *fileforsize;
+				//fileforsize = fopen(outFileName, O_RDONLY);
+				//fseek(fileforsize, 0L, SEEK_END);
+				//pFileSize = ftell(fileforsize);
+				//if(fileforsize)
+				//	fclose(fileforsize);
+					
 				log("Opening: %s\n", outFileName);
 				out_file_fd = open(outFileName, O_RDONLY);
+				
+				//struct stat stat_buf;
+				//int rc = fstat(out_file_fd, &stat_buf);
+				//if(rc == 0)
+				//	pFileSize = stat_buf.st_size;
+				//else
+				//	pFileSize = 0;
+					
+				//count the number of lines in the file by iterating through the file and counting the '\n' characters.
+				pNumLines = 0;
+				pFileSize = 0;
+				unsigned char c;
+				int ret = read(out_file_fd, &c, 1);
+				while(c != EOF)
+				{
+					if(c == '\n')
+						pNumLines++;
+					pFileSize++;
+					
+					ret = read(out_file_fd, &c, 1);
+					if(ret == 0)
+					   break;
+				}
+				lseek(out_file_fd, 0L, SEEK_SET);  //go back to the beginning.
+				
+				
+				log("File Descriptor: %d, Size:%d, Lines:%d\n", out_file_fd, pFileSize);
 				if (out_file_fd <= 0) 
 				{
 					log("Error opening %s to send. Does it exist and have read permissions?\n", outFileName);
 				}
 				else
 				{
+					pBytesSent = 0;
+					pCurrentLine = 0;
+		
 					setRTS( 1 );  //tell the machine we are ready to send data.
 					log("Starting Transfer.\r\n");
 					pSendingFile = 1;
 					
 					if(pFlowControl == FLOW_CONTROL_SOFTWARE)
+					{
 						pClearToSend = 1;  //default to sending if sw handshaking
+						//SW handshaking requires a control byte at the start and end
+						sendByte( DC2 );  //DC2
+					}
 				}			
 			}
 			
 			if(pStopSendingFile)  //this is set by the user
 			{
 				pStopSendingFile = 0;
+				
 				log("Stopping send file.\n");
 				if(out_file_fd > 0)
 				{
 					close(out_file_fd);
 					out_file_fd = 0;
 				}
+				pUserPaused = 0;
 				//wait for TX queue to empty before clearing sending flag
 				txData.reset();  //immediately stop sending data by clearing the TX queue
 				end_of_file = 1;
@@ -1434,6 +2166,10 @@ int CNCSerial::serialPollingThread()
 			
 			if(end_of_file && txData.isEmpty())
 			{
+				if(pFlowControl == FLOW_CONTROL_SOFTWARE)
+				{
+					sendByte( DC4 );
+				}
 				end_of_file = 0;
 				log("File Sent Completely.\r\n");
 								
@@ -1445,7 +2181,7 @@ int CNCSerial::serialPollingThread()
 				pSendingFile = 0;
 			}
 			
-			if(pSendingFile && pClearToSend && (!pUserPaused) && (!pMachinePaused))  //if we are sending a file and not held up by flow control
+			if(pSendingFile && pClearToSend && (!pUserPaused) && (!pMachinePaused) )  //if we are sending a file and not held up by flow control
 			{
 				//if(!file_fd)
 				//{
@@ -1505,6 +2241,21 @@ int CNCSerial::serialPollingThread()
 			{
 				//pClearToSend is managed inside of receive parsing
 			}
+			else if(pFlowControl == FLOW_CONTROL_GRBL)
+			{
+				//if we received 'ok\r\n' then it is OK to send the next line.
+				if(pGRBLNextFlag == 1)  
+				{
+					//reset the timeout timer..
+					GRBLtimeout.Start();
+					pClearToSend = 1;
+					pGRBLNextFlag = 0;
+				}
+				else
+				{
+					pClearToSend = 0;
+				}
+			}
 			else  //no flow control
 			{
 				pClearToSend = 1;
@@ -1512,32 +2263,106 @@ int CNCSerial::serialPollingThread()
 			
 			if(pClearToSend && (!pUserPaused) && (!pMachinePaused) && !txData.isEmpty() && delay_timer.Expired(pPacketDelay))
 			{
-				int max_tx_bytes = pPacketLength;
-				if(max_tx_bytes == 0)
-					max_tx_bytes = CNC_BUF_SIZE;  //set to max
 				
-				int num_tx_bytes = txData.getData(outbuf, max_tx_bytes);  //request the max
-				
-				//be careful, if we overflow the TX buffer, there is no real indication!!
-				int num_written = write(serial_fd, outbuf, num_tx_bytes);
-				pBytesSent += num_written;	
-				
-				if(pLogTx)
-					write(tx_log_fd, outbuf, num_written);
-			
-				if(num_written > 0) 
+				int num_tx_bytes = 0;
+				// read out byte by byte until we get to a '\n'
+				if(pSingleStep )  //this is the machine mode. User needs to press the start button for each line.
 				{
-					if(pflushRequested)
-					{
-						tcdrain(serial_fd);
-					}
 					
-					if(pPacketDelay)
+					if(pDoStep == 1)
 					{
-						delay_timer.Start();
+						pDoStep = 0;
+					
+						for(int n = 0; n < CNC_BUF_SIZE; n++)
+						{
+							if(txData.getData(&outbuf[n], 1) == 1)  //
+							{
+								num_tx_bytes++;
+								if(outbuf[n] == '\n')
+								{
+									pCurrentLine++;
+									n = CNC_BUF_SIZE;  //get out of the for loop
+								}
+							}
+							else
+							{
+								n = CNC_BUF_SIZE;  //get out of the for loop
+							}
+						}
+					}
+					//otherwise, do nothing, effectively waiting for a button press..
+
+				}
+				else if((pPacketLength == 0) && (pPacketDelay != 0))
+				{
+					//if length = 0 and delay != 0, send 1 line of gCode then delay
+					for(int n = 0; n < CNC_BUF_SIZE; n++)
+					{
+						if(txData.getData(&outbuf[n], 1) == 1)  //
+						{
+							num_tx_bytes++;
+							if(outbuf[n] == '\n')
+							{
+								pCurrentLine++;
+								n = CNC_BUF_SIZE;  //get out of the for loop
+							}
+						}
+						else
+						{
+							n = CNC_BUF_SIZE;  //get out of the for loop
+						}
 					}
 				}
-			}
+				else  //pPacketDelay == 0 || pPacketLength != 0
+				{
+					int max_tx_bytes = pPacketLength;
+					if(max_tx_bytes == 0)
+						max_tx_bytes = CNC_BUF_SIZE;  //set to max
+					//num_tx_bytes = txData.getData(outbuf, max_tx_bytes);  //request the max
+					
+					for(int n = 0; n < max_tx_bytes; n++)
+					{
+						if(txData.getData(&outbuf[n], 1) == 1)  //
+						{
+							num_tx_bytes++;
+							if(outbuf[n] == '\n')
+							{
+								pCurrentLine++;
+							}
+						}
+						else
+						{
+							n = CNC_BUF_SIZE;  //get out of the for loop
+						}
+					}
+
+				}
+				
+				if(num_tx_bytes > 0)
+				{
+					//be careful, if we overflow the TX buffer, there is no real indication!!
+					int num_written = write(serial_fd, outbuf, num_tx_bytes);
+					pBytesSent += num_written;	
+					
+					log("%d [%s]\n", num_tx_bytes, outbuf);
+					
+					if(pLogTx)
+						write(tx_log_fd, outbuf, num_written);
+				
+					if(num_written > 0) 
+					{
+						if(pflushRequested)
+						{
+							tcdrain(serial_fd);
+						}
+						
+						if(pPacketDelay)
+						{
+							delay_timer.Start();
+						}
+					}
+				}
+			} 
 
 			
 			
@@ -1582,6 +2407,9 @@ void CNCSerial::log(const char *message, ...)
 	va_start (argp, message) ;
 	vsnprintf (buffer, 1023, message, argp) ;
 	va_end (argp) ;
+	
+	setStatus(buffer);
+	
 
 	//serialPuts (fd, buffer) ;
 	if((pLogMode & LOG_MODE_PRINT) == LOG_MODE_PRINT)
@@ -1594,10 +2422,10 @@ void CNCSerial::log(const char *message, ...)
 		//
 		if(log_fd <= 0)
 		{
-			log_fd = open("CNCSerial.log", O_CREAT|O_RDWR, 0666);  //read and write permissions (octal)
+			log_fd = open("./Logs/CNCSerial.log", O_CREAT|O_RDWR, 0666);  //read and write permissions (octal)
 			if (log_fd <= 0) 
 			{
-				printf("Error opening %s to log. Does it exist already?\n", "CNCSerial.log");
+				printf("Error opening %s to log. Does the folder exist?\n", "CNCSerial.log");
 				printf("Error %d, description is : %s\n",errno, strerror(errno));
 				printf("Setting log mode to printing.\n");
 				pLogMode = LOG_MODE_PRINT;
